@@ -1,0 +1,6 @@
+fastapi
+uvicorn[standard]
+pydantic
+yt-dlp
+curl-cffi
+imageio-ffmpeg
