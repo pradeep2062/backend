@@ -1,9 +1,11 @@
 FROM python:3.11-slim
 
-# Install system dependencies
+# Install system dependencies used by yt-dlp and media merging.
 RUN apt-get update && apt-get install -y \
     ffmpeg \
     curl \
+    ca-certificates \
+    nodejs \
     && rm -rf /var/lib/apt/lists/*
 
 # Install yt-dlp (latest binary)

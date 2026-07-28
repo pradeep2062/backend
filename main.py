@@ -81,6 +81,42 @@ async def require_allowed_frontend(request: Request, call_next):
         },
     )
 
+@app.exception_handler(HTTPException)
+async def production_http_exception_handler(request: Request, exc: HTTPException):
+    message = exc.detail if isinstance(exc.detail, str) else "Request failed. Please try again."
+    if exc.status_code >= 500 and "YouTube is asking" not in message:
+        message = "Something went wrong while processing the request. Please try again later."
+    request_id = uuid.uuid4().hex[:12]
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "detail": message,
+            "error": {
+                "code": f"HTTP_{exc.status_code}",
+                "message": message,
+                "request_id": request_id,
+            },
+        },
+    )
+
+
+@app.exception_handler(Exception)
+async def production_unhandled_exception_handler(request: Request, exc: Exception):
+    request_id = uuid.uuid4().hex[:12]
+    logger.exception("Unhandled request error %s", request_id)
+    message = "Something went wrong while processing the request. Please try again later."
+    return JSONResponse(
+        status_code=500,
+        content={
+            "detail": message,
+            "error": {
+                "code": "INTERNAL_SERVER_ERROR",
+                "message": message,
+                "request_id": request_id,
+            },
+        },
+    )
+
 
 TEMP_DIR = Path(tempfile.gettempdir()) / "ytdl_temp"
 TEMP_DIR.mkdir(exist_ok=True)
@@ -182,14 +218,15 @@ YOUTUBE_CLIENT_PROFILES = build_client_profiles()
 YTDL_CONCURRENT_FRAGMENTS = str(get_env_int("YTDL_CONCURRENT_FRAGMENTS", 16, 1))
 YTDL_HTTP_CHUNK_SIZE = os.getenv("YTDL_HTTP_CHUNK_SIZE", "10M").strip() or None
 
-YTDL_IMPERSONATE = os.getenv("YTDL_IMPERSONATE", "").strip() or None
+YTDL_IMPERSONATE = os.getenv("YTDL_IMPERSONATE", "chrome").strip() or None
 YTDL_USER_AGENT = os.getenv("YTDL_USER_AGENT", "").strip() or None
 YTDL_SOURCE_ADDRESS = os.getenv("YTDL_SOURCE_ADDRESS", "").strip() or None
-YTDL_EXTRACT_SLEEP_SECONDS = get_env_float("YTDL_EXTRACT_SLEEP_SECONDS", 0.0, 0.0)
+YTDL_FORCE_IPV4 = get_env_bool("YTDL_FORCE_IPV4", True)
+YTDL_EXTRACT_SLEEP_SECONDS = get_env_float("YTDL_EXTRACT_SLEEP_SECONDS", 0.2, 0.0)
 YTDL_ENABLE_BROWSER_COOKIE_FALLBACK = get_env_bool("YTDL_ENABLE_BROWSER_COOKIE_FALLBACK", False)
 
-YTDL_FORMAT_MAX_PROFILE_ATTEMPTS = get_env_int("YTDL_FORMAT_MAX_PROFILE_ATTEMPTS", 2, 1)
-YTDL_DOWNLOAD_MAX_PROFILE_ATTEMPTS = get_env_int("YTDL_DOWNLOAD_MAX_PROFILE_ATTEMPTS", 4, 1)
+YTDL_FORMAT_MAX_PROFILE_ATTEMPTS = get_env_int("YTDL_FORMAT_MAX_PROFILE_ATTEMPTS", 4, 1)
+YTDL_DOWNLOAD_MAX_PROFILE_ATTEMPTS = get_env_int("YTDL_DOWNLOAD_MAX_PROFILE_ATTEMPTS", 8, 1)
 YTDL_FORMAT_TIMEOUT_SEC = get_env_int("YTDL_FORMAT_TIMEOUT_SEC", 28, 5)
 YTDL_DOWNLOAD_TIMEOUT_SEC = get_env_int("YTDL_DOWNLOAD_TIMEOUT_SEC", 300, 60)
 YTDL_PLAYLIST_INFO_TIMEOUT_SEC = get_env_int("YTDL_PLAYLIST_INFO_TIMEOUT_SEC", 60, 10)
@@ -197,7 +234,7 @@ YTDL_PLAYLIST_DOWNLOAD_TIMEOUT_SEC = get_env_int("YTDL_PLAYLIST_DOWNLOAD_TIMEOUT
 YTDL_MIX_PLAYLIST_MAX_ITEMS = get_env_int("YTDL_MIX_PLAYLIST_MAX_ITEMS", 50, 1)
 
 YTDL_MAX_CONCURRENT_PROCESSES = get_env_int("YTDL_MAX_CONCURRENT_PROCESSES", 5, 1)
-YTDL_MIN_START_INTERVAL_SECONDS = get_env_float("YTDL_MIN_START_INTERVAL_SECONDS", 0.05, 0.0)
+YTDL_MIN_START_INTERVAL_SECONDS = get_env_float("YTDL_MIN_START_INTERVAL_SECONDS", 0.2, 0.0)
 YTDLP_SEMAPHORE = asyncio.Semaphore(YTDL_MAX_CONCURRENT_PROCESSES)
 YTDLP_START_LOCK = asyncio.Lock()
 LAST_YTDLP_START_MONOTONIC = 0.0
@@ -289,6 +326,8 @@ def append_network_auth_flags(cmd: list[str]) -> None:
 def append_common_network_flags(cmd: list[str]) -> None:
     if YTDL_IMPERSONATE:
         cmd += ["--impersonate", YTDL_IMPERSONATE]
+    if YTDL_FORCE_IPV4:
+        cmd += ["--force-ipv4"]
     if YTDL_USER_AGENT:
         cmd += ["--add-headers", f"User-Agent:{YTDL_USER_AGENT}"]
     if YTDL_SOURCE_ADDRESS:
@@ -317,7 +356,19 @@ def build_extractor_args(
 
 def is_yt_bot_check(err: str) -> bool:
     e = err.lower()
-    return "too many requests" in e or "not a bot" in e or "sign in to confirm" in e
+    return any(
+        marker in e
+        for marker in (
+            "too many requests",
+            "not a bot",
+            "confirm you're not a bot",
+            "sign in to confirm",
+            "unusual traffic",
+            "automated requests",
+            "http error 429",
+            "error 429",
+        )
+    )
 
 
 def is_cookie_source_error(err: str) -> bool:
@@ -340,26 +391,16 @@ def is_cookie_source_error(err: str) -> bool:
 def classify_yt_error(err: str) -> tuple[int, str]:
     e = err.lower()
     if "requested format is not available" in e or "requested format not available" in e:
-        return 409, "Selected format is not currently available"
+        return 409, "Selected quality is not currently available. Please refresh formats and choose another quality."
     if "video unavailable" in e or "this video is unavailable" in e or "private video" in e:
-        return 404, "Video unavailable or private"
+        return 404, "This video is unavailable or private."
     if is_yt_bot_check(err):
-        mitigation_parts: list[str] = []
-        if not YTDL_PROXY_URL and not YTDL_COOKIES_FILE:
-            mitigation_parts.append("configure YTDL_PROXY_URL")
-        if not YTDL_YOUTUBE_PO_TOKEN:
-            mitigation_parts.append("optionally add YTDL_YOUTUBE_PO_TOKEN for mweb")
-
-        mitigation_hint = ""
-        if mitigation_parts:
-            mitigation_hint = " Mitigation: " + ", ".join(mitigation_parts) + "."
         return (
-            429,
-            "YouTube blocked this request (rate-limit / bot check). This is a server-side IP restriction; changing device won't help. "
-            "The server auto-tried available bypass strategies. Try again later or use another video."
-            + mitigation_hint,
+            503,
+            "YouTube is asking this server for additional verification before it can download this video. "
+            "Try again shortly. If this continues in production, configure cookies, a YouTube PO token, or a trusted outbound proxy for the backend.",
         )
-    return 400, "Failed to fetch video info"
+    return 400, "Could not fetch video information. Please check the URL and try again."
 
 
 async def run_yt_dlp(args: list[str], timeout_sec: int) -> tuple[int, str, str]:
@@ -400,8 +441,6 @@ async def run_yt_dlp_with_cookie_fallback(
     # For non bot-check errors, fail fast on the base attempt.
     if not is_yt_bot_check(base_err):
         status, msg = classify_yt_error(base_err)
-        if status in (400, 409) and base_err:
-            msg = f"{msg}. yt-dlp: {base_err.splitlines()[0][:220]}"
         raise HTTPException(status_code=status, detail=msg)
 
     # Base attempt triggered a bot-check; try browser cookie fallbacks.
@@ -411,8 +450,6 @@ async def run_yt_dlp_with_cookie_fallback(
     # avoid expensive local-browser scans and return classified error immediately.
     if (not YTDL_ENABLE_BROWSER_COOKIE_FALLBACK) or YTDL_COOKIES_FILE:
         status, msg = classify_yt_error(last_err)
-        if status in (400, 409) and last_err:
-            msg = f"{msg}. yt-dlp: {last_err.splitlines()[0][:220]}"
         raise HTTPException(status_code=status, detail=msg)
 
     for browser in BROWSER_COOKIE_SOURCES:
@@ -440,8 +477,6 @@ async def run_yt_dlp_with_cookie_fallback(
         break
 
     status, msg = classify_yt_error(last_err)
-    if status in (400, 409) and last_err:
-        msg = f"{msg}. yt-dlp: {last_err.splitlines()[0][:220]}"
     raise HTTPException(status_code=status, detail=msg)
 
 
@@ -989,7 +1024,8 @@ async def get_formats(req: URLRequest):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.exception("Unexpected backend error")
+        raise HTTPException(status_code=500, detail="Something went wrong while processing the request. Please try again later.")
     finally:
         INFLIGHT_FORMAT_REQUESTS.pop(cache_key, None)
 
@@ -1159,28 +1195,21 @@ async def stream_video_download(req: DownloadRequest):
                 raise HTTPException(status_code=504, detail="Download timed out")
             except HTTPException as ex:
                 download_errors.append(ex)
-                # FIX 1: Only stop early on genuine bot-checks (429) or truly
-                # unrecoverable errors (FFmpeg missing, etc.).  "Unavailable"
-                # (404) and generic 400 errors might just be a profile mismatch,
-                # so we continue and let the next profile attempt run.
-                if ex.status_code == 429:
-                    break  # rate-limited — no point retrying immediately
+                if ex.status_code in (401, 403):
+                    break
 
         if not download_succeeded:
-            rate_limited_error = next((e for e in download_errors if e.status_code == 429), None)
+            verification_error = next((e for e in download_errors if e.status_code == 503), None)
             format_unavailable_error = next((e for e in download_errors if e.status_code == 409), None)
-            if rate_limited_error is not None:
-                raise HTTPException(
-                    status_code=429,
-                    detail="YouTube blocked this download (rate-limit / bot check). Try again later or a different video.",
-                )
+            if verification_error is not None:
+                raise verification_error
             if format_unavailable_error is not None:
                 raise HTTPException(
                     status_code=409,
                     detail="Selected quality stream is temporarily unavailable. Refetch formats and try again.",
                 )
             if download_errors:
-                raise HTTPException(status_code=400, detail=f"Download failed: {download_errors[-1].detail}")
+                raise download_errors[-1]
             raise HTTPException(status_code=500, detail="Download failed due to unknown error")
 
         # Find the output file
@@ -1223,7 +1252,8 @@ async def stream_video_download(req: DownloadRequest):
         raise
     except Exception as e:
         shutil.rmtree(session_dir, ignore_errors=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.exception("Unexpected backend error")
+        raise HTTPException(status_code=500, detail="Something went wrong while processing the request. Please try again later.")
 
 
 @app.post("/download")
@@ -1287,18 +1317,14 @@ async def stream_playlist_download(req: PlaylistDownloadRequest):
                 raise HTTPException(status_code=504, detail="Playlist download timed out")
             except HTTPException as ex:
                 download_errors.append(ex)
-                if ex.status_code == 429:
+                if ex.status_code in (401, 403):
                     break
-
         if not download_succeeded:
-            rate_limited_error = next((e for e in download_errors if e.status_code == 429), None)
-            if rate_limited_error is not None:
-                raise HTTPException(
-                    status_code=429,
-                    detail="YouTube blocked this playlist download (rate-limit / bot check). Try again later.",
-                )
+            verification_error = next((e for e in download_errors if e.status_code == 503), None)
+            if verification_error is not None:
+                raise verification_error
             if download_errors:
-                raise HTTPException(status_code=400, detail=f"Playlist download failed: {download_errors[-1].detail}")
+                raise download_errors[-1]
             raise HTTPException(status_code=500, detail="Playlist download failed due to unknown error")
 
         downloaded_files = [path for path in downloads_dir.rglob("*") if path.is_file()]
@@ -1332,7 +1358,8 @@ async def stream_playlist_download(req: PlaylistDownloadRequest):
         raise
     except Exception as e:
         shutil.rmtree(session_dir, ignore_errors=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.exception("Unexpected backend error")
+        raise HTTPException(status_code=500, detail="Something went wrong while processing the request. Please try again later.")
 
 
 @app.post("/download-playlist")
@@ -1380,6 +1407,7 @@ async def health():
         "impersonate_configured": bool(YTDL_IMPERSONATE),
         "user_agent_configured": bool(YTDL_USER_AGENT),
         "source_address_configured": bool(YTDL_SOURCE_ADDRESS),
+        "force_ipv4": YTDL_FORCE_IPV4,
         "player_clients_override": YTDL_PLAYER_CLIENTS,
         "visitor_data_configured": bool(YTDL_YOUTUBE_VISITOR_DATA),
         "po_token_configured": bool(YTDL_YOUTUBE_PO_TOKEN),
