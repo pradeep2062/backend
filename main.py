@@ -1,4 +1,6 @@
 import asyncio
+import atexit
+import base64
 import logging
 import os
 import re
@@ -19,6 +21,9 @@ import json
 import shutil
 
 DEFAULT_ALLOWED_FRONTEND_ORIGIN = "https://you-tubevideos-downloader.vercel.app"
+
+logger = logging.getLogger("ytdl")
+logger.setLevel(logging.INFO)
 
 
 def normalize_origin(value: str) -> str:
@@ -84,7 +89,7 @@ async def require_allowed_frontend(request: Request, call_next):
 @app.exception_handler(HTTPException)
 async def production_http_exception_handler(request: Request, exc: HTTPException):
     message = exc.detail if isinstance(exc.detail, str) else "Request failed. Please try again."
-    if exc.status_code >= 500 and "YouTube is asking" not in message:
+    if exc.status_code >= 500 and exc.status_code != 503:
         message = "Something went wrong while processing the request. Please try again later."
     request_id = uuid.uuid4().hex[:12]
     return JSONResponse(
@@ -152,14 +157,59 @@ def get_env_bool(name: str, default: bool) -> bool:
 YT_DLP = shutil.which("yt-dlp") or "yt-dlp"
 
 
-def resolve_optional_cookies_file() -> str | None:
-    raw = os.getenv("YTDL_COOKIES_FILE", "").strip()
-    if not raw:
+def cleanup_runtime_secret_file(path: Path) -> None:
+    try:
+        path.unlink(missing_ok=True)
+    except Exception:
+        logger.debug("Could not remove runtime secret file %s", path)
+
+
+def write_runtime_secret_file(name: str, content: str) -> str | None:
+    cleaned = content.replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not cleaned:
         return None
 
-    candidate = Path(raw).expanduser()
-    if candidate.exists() and candidate.is_file():
-        return str(candidate)
+    fd, temp_path = tempfile.mkstemp(prefix=f"ytdl_{name}_", suffix=".txt", dir=TEMP_DIR)
+    path = Path(temp_path)
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+
+    with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+        handle.write(cleaned)
+        handle.write("\n")
+
+    atexit.register(cleanup_runtime_secret_file, path)
+    return str(path)
+
+
+def decode_cookie_env_content() -> str | None:
+    raw_b64 = os.getenv("YTDL_COOKIES_B64", "").strip()
+    if raw_b64:
+        try:
+            return base64.b64decode(raw_b64.encode("utf-8"), validate=True).decode("utf-8")
+        except Exception:
+            logger.warning("YTDL_COOKIES_B64 is set but could not be decoded as UTF-8 base64.")
+            return None
+
+    raw = os.getenv("YTDL_COOKIES", "").strip()
+    if raw:
+        return raw.replace("\\n", "\n")
+    return None
+
+
+def resolve_optional_cookies_file() -> str | None:
+    raw_file = os.getenv("YTDL_COOKIES_FILE", "").strip()
+    if raw_file:
+        candidate = Path(raw_file).expanduser()
+        if candidate.exists() and candidate.is_file():
+            return str(candidate)
+
+    cookie_content = decode_cookie_env_content()
+    if cookie_content:
+        return write_runtime_secret_file("cookies", cookie_content)
+
     return None
 
 
@@ -185,9 +235,26 @@ FORMAT_CACHE: dict[str, tuple[float, dict, str | None]] = {}
 INFLIGHT_FORMAT_REQUESTS: dict[str, "asyncio.Task[dict]"] = {}
 FORMAT_CACHE_TTL_SECONDS = 1200
 
+
+def normalize_po_token(raw: str | None, default_binding: str) -> str | None:
+    if not raw:
+        return None
+
+    normalized_tokens: list[str] = []
+    for token in raw.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        normalized_tokens.append(token if "+" in token else f"{default_binding}+{token}")
+
+    return ",".join(normalized_tokens) or None
+
+
 YTDL_PLAYER_CLIENTS = os.getenv("YTDL_PLAYER_CLIENTS", "").strip() or None
 YTDL_YOUTUBE_VISITOR_DATA = os.getenv("YTDL_YOUTUBE_VISITOR_DATA", "").strip() or None
-YTDL_YOUTUBE_PO_TOKEN = os.getenv("YTDL_YOUTUBE_PO_TOKEN", "").strip() or None
+YTDL_YOUTUBE_PO_TOKEN_BINDING = os.getenv("YTDL_YOUTUBE_PO_TOKEN_BINDING", "mweb.gvs").strip() or "mweb.gvs"
+YTDL_YOUTUBE_PO_TOKEN_RAW = os.getenv("YTDL_YOUTUBE_PO_TOKEN", "").strip() or None
+YTDL_YOUTUBE_PO_TOKEN = normalize_po_token(YTDL_YOUTUBE_PO_TOKEN_RAW, YTDL_YOUTUBE_PO_TOKEN_BINDING)
 
 
 def build_client_profiles() -> tuple[str | None, ...]:
@@ -221,6 +288,11 @@ YTDL_HTTP_CHUNK_SIZE = os.getenv("YTDL_HTTP_CHUNK_SIZE", "10M").strip() or None
 YTDL_IMPERSONATE = os.getenv("YTDL_IMPERSONATE", "chrome").strip() or None
 YTDL_USER_AGENT = os.getenv("YTDL_USER_AGENT", "").strip() or None
 YTDL_SOURCE_ADDRESS = os.getenv("YTDL_SOURCE_ADDRESS", "").strip() or None
+YTDL_POT_PROVIDER_URL = os.getenv("YTDL_POT_PROVIDER_URL", "").strip().rstrip("/") or None
+YTDL_POT_PROVIDER_SCRIPT_HOME = os.getenv("YTDL_POT_PROVIDER_SCRIPT_HOME", "").strip() or None
+YTDL_POT_PROVIDER_SCRIPT_PATH = os.getenv("YTDL_POT_PROVIDER_SCRIPT_PATH", "").strip() or None
+YTDL_POT_TOKEN_TTL_HOURS = str(get_env_int("YTDL_POT_TOKEN_TTL_HOURS", get_env_int("TOKEN_TTL", 6, 1), 1))
+os.environ.setdefault("TOKEN_TTL", YTDL_POT_TOKEN_TTL_HOURS)
 YTDL_FORCE_IPV4 = get_env_bool("YTDL_FORCE_IPV4", True)
 YTDL_EXTRACT_SLEEP_SECONDS = get_env_float("YTDL_EXTRACT_SLEEP_SECONDS", 0.2, 0.0)
 YTDL_ENABLE_BROWSER_COOKIE_FALLBACK = get_env_bool("YTDL_ENABLE_BROWSER_COOKIE_FALLBACK", False)
@@ -239,18 +311,17 @@ YTDLP_SEMAPHORE = asyncio.Semaphore(YTDL_MAX_CONCURRENT_PROCESSES)
 YTDLP_START_LOCK = asyncio.Lock()
 LAST_YTDLP_START_MONOTONIC = 0.0
 
-logger = logging.getLogger("ytdl")
-logger.setLevel(logging.INFO)
-
 YTDL_PROXY_URL = os.getenv("YTDL_PROXY_URL", "").strip() or None
 YTDL_COOKIES_FILE_CONFIGURED = bool(os.getenv("YTDL_COOKIES_FILE", "").strip())
+YTDL_COOKIES_ENV_CONFIGURED = bool(os.getenv("YTDL_COOKIES", "").strip() or os.getenv("YTDL_COOKIES_B64", "").strip())
+YTDL_COOKIES_CONFIGURED = YTDL_COOKIES_FILE_CONFIGURED or YTDL_COOKIES_ENV_CONFIGURED
 YTDL_COOKIES_FILE = resolve_optional_cookies_file()
 
-if YTDL_COOKIES_FILE_CONFIGURED and not YTDL_COOKIES_FILE:
-    logger.warning("YTDL_COOKIES_FILE is set but the file is not readable in this runtime.")
+if YTDL_COOKIES_CONFIGURED and not YTDL_COOKIES_FILE:
+    logger.warning("YouTube cookies are configured but no readable cookies file could be prepared.")
 
 if YTDL_YOUTUBE_PO_TOKEN and not YTDL_PLAYER_CLIENTS:
-    logger.info("PO token configured. Consider setting YTDL_PLAYER_CLIENTS=mweb,web_safari for best reliability.")
+    logger.info("PO token configured with binding %s. Consider setting YTDL_PLAYER_CLIENTS=mweb,web_safari for best reliability.", YTDL_YOUTUBE_PO_TOKEN_BINDING)
 
 
 def safe_decode(data: bytes) -> str:
@@ -334,6 +405,16 @@ def append_common_network_flags(cmd: list[str]) -> None:
         cmd += ["--source-address", YTDL_SOURCE_ADDRESS]
 
 
+def append_pot_provider_extractor_args(cmd: list[str]) -> None:
+    if YTDL_POT_PROVIDER_URL:
+        cmd += ["--extractor-args", f"youtubepot-bgutilhttp:base_url={YTDL_POT_PROVIDER_URL}"]
+
+    if YTDL_POT_PROVIDER_SCRIPT_HOME:
+        cmd += ["--extractor-args", f"youtubepot-bgutilscript:server_home={YTDL_POT_PROVIDER_SCRIPT_HOME}"]
+    elif YTDL_POT_PROVIDER_SCRIPT_PATH:
+        cmd += ["--extractor-args", f"youtubepot-bgutilscript:script_path={YTDL_POT_PROVIDER_SCRIPT_PATH}"]
+
+
 def build_extractor_args(
     client_profile: str | None,
     *,
@@ -397,8 +478,8 @@ def classify_yt_error(err: str) -> tuple[int, str]:
     if is_yt_bot_check(err):
         return (
             503,
-            "YouTube is asking this server for additional verification before it can download this video. "
-            "Try again shortly. If this continues in production, configure cookies, a YouTube PO token, or a trusted outbound proxy for the backend.",
+            "The backend could not pass YouTube verification for this video. "
+            "The automatic PO-token provider, cookies, or outbound proxy may be missing or unhealthy. Please try again shortly.",
         )
     return 400, "Could not fetch video information. Please check the URL and try again."
 
@@ -518,6 +599,7 @@ def build_download_command(
     )
     if extractor_args:
         cmd += ["--extractor-args", extractor_args]
+    append_pot_provider_extractor_args(cmd)
 
     if YTDL_EXTRACT_SLEEP_SECONDS > 0:
         cmd += ["--sleep-requests", str(YTDL_EXTRACT_SLEEP_SECONDS)]
@@ -575,6 +657,7 @@ def build_playlist_info_command(url: str, *, client_profile: str | None) -> list
     )
     if extractor_args:
         cmd += ["--extractor-args", extractor_args]
+    append_pot_provider_extractor_args(cmd)
 
     if YTDL_EXTRACT_SLEEP_SECONDS > 0:
         cmd += ["--sleep-requests", str(YTDL_EXTRACT_SLEEP_SECONDS)]
@@ -658,6 +741,7 @@ def build_playlist_download_command(
     )
     if extractor_args:
         cmd += ["--extractor-args", extractor_args]
+    append_pot_provider_extractor_args(cmd)
 
     if YTDL_EXTRACT_SLEEP_SECONDS > 0:
         cmd += ["--sleep-requests", str(YTDL_EXTRACT_SLEEP_SECONDS)]
@@ -727,6 +811,7 @@ async def fetch_video_json(url: str, client_profile: str | None) -> tuple[dict, 
         )
         if extractor_args:
             cmd += ["--extractor-args", extractor_args]
+        append_pot_provider_extractor_args(cmd)
 
         if YTDL_EXTRACT_SLEEP_SECONDS > 0:
             cmd += ["--sleep-requests", str(YTDL_EXTRACT_SLEEP_SECONDS)]
@@ -1407,10 +1492,16 @@ async def health():
         "impersonate_configured": bool(YTDL_IMPERSONATE),
         "user_agent_configured": bool(YTDL_USER_AGENT),
         "source_address_configured": bool(YTDL_SOURCE_ADDRESS),
+        "pot_provider_url_configured": bool(YTDL_POT_PROVIDER_URL),
+        "pot_provider_script_configured": bool(YTDL_POT_PROVIDER_SCRIPT_HOME or YTDL_POT_PROVIDER_SCRIPT_PATH),
+        "pot_token_ttl_hours": YTDL_POT_TOKEN_TTL_HOURS,
         "force_ipv4": YTDL_FORCE_IPV4,
         "player_clients_override": YTDL_PLAYER_CLIENTS,
         "visitor_data_configured": bool(YTDL_YOUTUBE_VISITOR_DATA),
         "po_token_configured": bool(YTDL_YOUTUBE_PO_TOKEN),
+        "po_token_binding": YTDL_YOUTUBE_PO_TOKEN_BINDING if YTDL_YOUTUBE_PO_TOKEN else None,
         "cookies_file_configured": YTDL_COOKIES_FILE_CONFIGURED,
+        "cookies_env_configured": YTDL_COOKIES_ENV_CONFIGURED,
+        "cookies_configured": YTDL_COOKIES_CONFIGURED,
         "cookies_file_available": bool(YTDL_COOKIES_FILE),
     }
